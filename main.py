@@ -1,40 +1,74 @@
 #!/usr/bin/env python3
-# update_calibre_metadata.py
-#
-# For every English book with an EPUB format in a Calibre library:
-# - Fetch updated metadata from the internet (and a cover if available)
-# - Apply it to the Calibre database
-# - If anything fails for a book, log it and continue
+"""
+Calibre bulk metadata updater + EPUB embedder (idempotent).
+
+What it does:
+- Finds all books that have EPUB format in the library.
+- Filters to "English" OR "language missing" (so you can fix missing language too).
+- For each book:
+  - If already "good enough" and already processed (tracked), skip.
+  - If "good enough" but not yet embedded, only embed metadata into EPUB.
+  - Otherwise:
+      - fetch-ebook-metadata -> OPF (+cover if found)
+      - calibredb set_metadata (apply OPF to Calibre DB)
+      - (optional) set cover field if downloaded
+      - calibredb embed_metadata --only-formats EPUB (write metadata into file)
+- If any step fails for a given book: record failure + continue.
+
+State:
+- Stored at: /drive/calibre/en_nonfiction/.calibre_metadata_state.json
+- Idempotence:
+  - We compute a stable hash of the *current DB metadata snapshot* we care about.
+  - If a book was already processed for that same hash, we skip it on reruns.
+  - If you manually change metadata later, the hash changes and it will reprocess.
+"""
 
 from __future__ import annotations
 
+import dataclasses
+import datetime as _dt
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
-from typing import Any
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
+
+# -----------------------
+# User config
+# -----------------------
 
 LIB = "/drive/calibre/en_nonfiction"
+STATE_PATH = os.path.join(LIB, ".calibre_metadata_state.json")
 
-# Calibre search query language: English + has EPUB
-SEARCH_EXPR = "languages:eng and formats:epub"
+# Only EPUB books (we filter in code; search is just a coarse prefilter)
+CALIBRE_SEARCH_EXPR = "formats:epub"
+
+# Treat as English if languages contains any of these (calibre often uses ISO639-3 like "eng")
+ENGLISH_CODES = {"en", "eng", "en-us", "en-gb"}
+
+# If a book has no language set at all, we still include it (so you can fix missing language)
+INCLUDE_MISSING_LANGUAGE = True
+
+# Metadata "good enough" scoring (tweak if you want)
+MIN_SCORE_TO_SKIP_FETCH = 6
+
+# Avoid hammering metadata sources (0.0 disables delay)
+DELAY_BETWEEN_FETCHES_SECONDS = 0.35
 
 
-def run(
-    cmd: list[str], *, check: bool = False, capture: bool = False
-) -> subprocess.CompletedProcess[str]:
-    # Extensive logging (you asked for it in general, and it's useful here)
-    print(f"\n[cmd] {' '.join(cmd)}", file=sys.stderr)
-    return subprocess.run(
-        cmd,
-        text=True,
-        check=check,
-        stdout=subprocess.PIPE if capture else None,
-        stderr=subprocess.PIPE if capture else None,
-    )
+# -----------------------
+# Helpers
+# -----------------------
+
+
+def log(msg: str) -> None:
+    # consistent, simple logging
+    print(msg, file=sys.stderr, flush=True)
 
 
 def require_tool(name: str) -> None:
@@ -42,9 +76,289 @@ def require_tool(name: str) -> None:
         raise SystemExit(f"Missing required tool on PATH: {name}")
 
 
-def get_books() -> list[dict[str, Any]]:
-    # Use --for-machine JSON output so we don't have to parse human text.
-    # Fields include isbn/identifiers so fetch-ebook-metadata can match better.
+def run(
+    cmd: List[str],
+    *,
+    check: bool = False,
+    capture: bool = False,
+    env: Optional[Dict[str, str]] = None,
+) -> subprocess.CompletedProcess[str]:
+    log(f"[cmd] {' '.join(cmd)}")
+    return subprocess.run(
+        cmd,
+        text=True,
+        check=check,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None,
+        env=env,
+    )
+
+
+def now_iso() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+
+def sha256_text(s: str) -> str:
+    h = hashlib.sha256()
+    h.update(s.encode("utf-8", errors="replace"))
+    return h.hexdigest()
+
+
+def stable_json_dumps(obj: Any) -> str:
+    # Deterministic JSON for hashing
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def normalize_languages(val: Any) -> List[str]:
+    # calibredb --for-machine often returns list; but be defensive
+    if val is None:
+        return []
+    if isinstance(val, list):
+        out = []
+        for x in val:
+            if x is None:
+                continue
+            out.append(str(x).strip().lower())
+        return [x for x in out if x]
+    s = str(val).strip().lower()
+    return [s] if s else []
+
+
+def is_english_or_missing(langs: List[str]) -> bool:
+    if not langs:
+        return INCLUDE_MISSING_LANGUAGE
+    # Some installs might store "English" or "en_US" — normalize a bit
+    for x in langs:
+        x2 = x.replace("_", "-").lower()
+        if x2 in ENGLISH_CODES:
+            return True
+        if x2.startswith("en-"):
+            return True
+        if x2 == "english":
+            return True
+    return False
+
+
+def has_epub(formats_val: Any) -> bool:
+    if formats_val is None:
+        return False
+    if isinstance(formats_val, list):
+        return any(
+            str(x).strip().lower() == "epub" for x in formats_val if x is not None
+        )
+    # Sometimes "EPUB, MOBI" etc
+    s = str(formats_val).lower()
+    return "epub" in {x.strip() for x in s.replace(";", ",").split(",")}
+
+
+def normalize_identifiers(val: Any) -> Dict[str, str]:
+    # Usually dict like {"isbn":"...", "asin":"..."}; convert to simple dict[str,str]
+    out: Dict[str, str] = {}
+    if isinstance(val, dict):
+        for k, v in val.items():
+            if v is None:
+                continue
+            ks = str(k).strip().lower()
+            vs = str(v).strip()
+            if ks and vs:
+                out[ks] = vs
+    return out
+
+
+def metadata_snapshot(book: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Snapshot the DB metadata fields we care about for:
+    - determining "good enough"
+    - idempotence (hash)
+    """
+    identifiers = normalize_identifiers(book.get("identifiers"))
+    langs = normalize_languages(book.get("languages"))
+
+    # Normalize authors (may be list or string)
+    authors_val = book.get("authors")
+    if isinstance(authors_val, list):
+        authors = [
+            str(a).strip() for a in authors_val if a is not None and str(a).strip()
+        ]
+    else:
+        a = str(authors_val or "").strip()
+        authors = [a] if a else []
+
+    # tags can also be list or string
+    tags_val = book.get("tags")
+    if isinstance(tags_val, list):
+        tags = [str(t).strip() for t in tags_val if t is not None and str(t).strip()]
+    else:
+        s = str(tags_val or "").strip()
+        tags = [x.strip() for x in s.split(",") if x.strip()] if s else []
+
+    snap = {
+        "title": str(book.get("title") or "").strip(),
+        "authors": authors,
+        "publisher": str(book.get("publisher") or "").strip(),
+        "pubdate": str(
+            book.get("pubdate") or ""
+        ).strip(),  # calibre may store ISO-ish datetime
+        "languages": langs,
+        "isbn": str(book.get("isbn") or "").strip(),
+        "identifiers": identifiers,  # already normalized
+        "tags": tags,
+        "comments_present": bool(str(book.get("comments") or "").strip()),
+        "cover_present": bool(book.get("cover")),  # often True/False-ish
+    }
+    return snap
+
+
+def snapshot_hash(snap: Dict[str, Any]) -> str:
+    return sha256_text(stable_json_dumps(snap))
+
+
+def score_good_enough(snap: Dict[str, Any]) -> Tuple[int, List[str]]:
+    """
+    Simple heuristic scoring to decide whether to skip online fetching.
+    You can tweak MIN_SCORE_TO_SKIP_FETCH if you want stricter/looser.
+    """
+    score = 0
+    reasons: List[str] = []
+
+    # Required-ish
+    if snap["title"]:
+        score += 1
+    else:
+        reasons.append("missing title")
+
+    if snap["authors"]:
+        score += 1
+    else:
+        reasons.append("missing authors")
+
+    # Valuable fields
+    if snap["publisher"]:
+        score += 1
+    else:
+        reasons.append("missing publisher")
+
+    if snap["pubdate"]:
+        score += 1
+    else:
+        reasons.append("missing pubdate")
+
+    # Identifiers: give extra weight (helps matching)
+    if snap["isbn"]:
+        score += 2
+    elif snap["identifiers"]:
+        score += 2
+    else:
+        reasons.append("missing identifiers/isbn")
+
+    if snap["tags"]:
+        score += 1
+    else:
+        reasons.append("missing tags")
+
+    if snap["comments_present"]:
+        score += 1
+    else:
+        reasons.append("missing description/comments")
+
+    if snap["cover_present"]:
+        score += 1
+    else:
+        reasons.append("missing cover")
+
+    return score, reasons
+
+
+# -----------------------
+# State handling
+# -----------------------
+
+
+@dataclasses.dataclass
+class BookState:
+    status: str  # "done" | "embedded_only" | "skipped_good_enough" | "failed"
+    last_hash: str
+    last_attempt_utc: str
+    last_ok_utc: Optional[str] = None
+    message: Optional[str] = None
+    fail_count: int = 0
+
+
+def load_state() -> Dict[str, Any]:
+    if not os.path.exists(STATE_PATH):
+        return {"version": 1, "updated_at_utc": None, "books": {}}
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        if not isinstance(obj, dict):
+            raise ValueError("state file not a dict")
+        obj.setdefault("version", 1)
+        obj.setdefault("books", {})
+        if not isinstance(obj["books"], dict):
+            obj["books"] = {}
+        return obj
+    except Exception as e:
+        raise SystemExit(f"Failed to read state file {STATE_PATH}: {e}")
+
+
+def save_state(state: Dict[str, Any]) -> None:
+    state["updated_at_utc"] = now_iso()
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, STATE_PATH)
+
+
+def get_book_state(state: Dict[str, Any], book_id: int) -> Optional[BookState]:
+    b = state.get("books", {}).get(str(book_id))
+    if not isinstance(b, dict):
+        return None
+    try:
+        return BookState(
+            status=str(b.get("status") or ""),
+            last_hash=str(b.get("last_hash") or ""),
+            last_attempt_utc=str(b.get("last_attempt_utc") or ""),
+            last_ok_utc=b.get("last_ok_utc"),
+            message=b.get("message"),
+            fail_count=int(b.get("fail_count") or 0),
+        )
+    except Exception:
+        return None
+
+
+def put_book_state(state: Dict[str, Any], book_id: int, bs: BookState) -> None:
+    state.setdefault("books", {})
+    state["books"][str(book_id)] = dataclasses.asdict(bs)
+
+
+# -----------------------
+# Calibre querying
+# -----------------------
+
+
+def list_candidate_books() -> List[Dict[str, Any]]:
+    # Pull enough fields to:
+    # - decide english/missing language
+    # - compute snapshot hash + good-enough score
+    fields = ",".join(
+        [
+            "id",
+            "title",
+            "authors",
+            "publisher",
+            "pubdate",
+            "languages",
+            "formats",
+            "isbn",
+            "identifiers",
+            "tags",
+            "comments",
+            "cover",
+            "last_modified",
+        ]
+    )
+
     cp = run(
         [
             "calibredb",
@@ -53,163 +367,399 @@ def get_books() -> list[dict[str, Any]]:
             "list",
             "--for-machine",
             "--fields",
-            "id,title,authors,isbn,identifiers,languages,formats",
+            fields,
             "--search",
-            SEARCH_EXPR,
+            CALIBRE_SEARCH_EXPR,
         ],
         capture=True,
         check=True,
     )
+
     try:
         data = json.loads(cp.stdout)
     except json.JSONDecodeError as e:
-        print(
-            "[error] Failed to parse JSON from calibredb list --for-machine",
-            file=sys.stderr,
-        )
-        print(cp.stdout, file=sys.stderr)
+        log("[fatal] Failed to parse JSON from calibredb list --for-machine")
+        log(cp.stdout)
         raise SystemExit(str(e))
 
     if not isinstance(data, list):
         raise SystemExit(f"Unexpected JSON shape from calibredb list: {type(data)}")
 
-    return data
+    out: List[Dict[str, Any]] = []
+    for b in data:
+        if not isinstance(b, dict):
+            continue
+        if not has_epub(b.get("formats")):
+            continue
+        langs = normalize_languages(b.get("languages"))
+        if not is_english_or_missing(langs):
+            continue
+        out.append(b)
 
-
-def normalize_identifiers(identifiers: Any) -> list[str]:
-    # calibredb "identifiers" usually comes back as a dict like {"isbn":"...", "asin":"..."}
-    # We convert to fetch-ebook-metadata --identifier key:value format(s).
-    out: list[str] = []
-    if isinstance(identifiers, dict):
-        for k, v in identifiers.items():
-            if v is None:
-                continue
-            s = str(v).strip()
-            if not s:
-                continue
-            out.append(f"{k}:{s}")
     return out
 
 
-def update_one(book: dict[str, Any], workdir: str) -> bool:
-    book_id = book.get("id")
-    title = (book.get("title") or "").strip()
-    authors = book.get(
-        "authors"
-    )  # can be list or string depending on calibre version/field
-    isbn = (book.get("isbn") or "").strip()
+# -----------------------
+# Update flow per book
+# -----------------------
+
+
+def fetch_metadata_to_opf_and_cover(
+    book: Dict[str, Any],
+    opf_path: str,
+    cover_path: str,
+) -> Tuple[bool, str]:
+    """
+    Returns (ok, message). On success, opf_path is created, cover_path may or may not exist.
+    """
+    title = str(book.get("title") or "").strip()
+    authors_val = book.get("authors")
+    if isinstance(authors_val, list):
+        authors = ", ".join(
+            str(a) for a in authors_val if a is not None and str(a).strip()
+        )
+    else:
+        authors = str(authors_val or "").strip()
+
+    isbn = str(book.get("isbn") or "").strip()
     identifiers = normalize_identifiers(book.get("identifiers"))
 
-    # Make stable, per-book temp paths
-    opf_path = os.path.join(workdir, f"{book_id}.opf")
-    cover_path = os.path.join(workdir, f"{book_id}.cover.jpg")
+    cmd = ["fetch-ebook-metadata", "--opf", opf_path, "--cover", cover_path]
 
-    # Build fetch-ebook-metadata command
-    fetch_cmd = ["fetch-ebook-metadata", "--opf", opf_path, "--cover", cover_path]
-
-    # Prefer ISBN if available (best matching)
     if isbn:
-        fetch_cmd += ["--isbn", isbn]
+        cmd += ["--isbn", isbn]
     else:
-        # Otherwise pass identifiers (asin, goodreads, etc.) if present
-        for ident in identifiers:
-            fetch_cmd += ["--identifier", ident]
-
-        # Fallback: title/authors if we don't have strong identifiers
+        # Prefer strong identifiers if we have them
+        for k, v in identifiers.items():
+            cmd += ["--identifier", f"{k}:{v}"]
+        # Fallback to title/authors
         if title:
-            fetch_cmd += ["--title", title]
-        # authors might be list or string
+            cmd += ["--title", title]
         if authors:
-            if isinstance(authors, list):
-                fetch_cmd += ["--authors", ", ".join(str(a) for a in authors)]
-            else:
-                fetch_cmd += ["--authors", str(authors)]
+            cmd += ["--authors", authors]
 
-    # Run fetch
-    cp_fetch = run(fetch_cmd, capture=True, check=False)
-    if cp_fetch.returncode != 0:
-        print(
-            f"[skip] id={book_id} title={title!r} (fetch failed: {cp_fetch.returncode})",
-            file=sys.stderr,
-        )
-        if cp_fetch.stderr:
-            print(cp_fetch.stderr, file=sys.stderr)
-        return False
+    cp = run(cmd, capture=True, check=False)
+    if cp.returncode != 0:
+        msg = f"fetch-ebook-metadata failed rc={cp.returncode}"
+        if cp.stderr:
+            msg += f" stderr={cp.stderr.strip()[:500]}"
+        return False, msg
 
-    # Apply OPF to Calibre database
-    cp_set = run(
+    if not os.path.exists(opf_path) or os.path.getsize(opf_path) == 0:
+        return False, "fetch-ebook-metadata produced no OPF"
+    return True, "fetched"
+
+
+def apply_opf_to_calibre_db(book_id: int, opf_path: str) -> Tuple[bool, str]:
+    cp = run(
         ["calibredb", "--with-library", LIB, "set_metadata", str(book_id), opf_path],
         capture=True,
         check=False,
     )
-    if cp_set.returncode != 0:
-        print(
-            f"[skip] id={book_id} title={title!r} (set_metadata failed: {cp_set.returncode})",
-            file=sys.stderr,
-        )
-        if cp_set.stderr:
-            print(cp_set.stderr, file=sys.stderr)
-        return False
+    if cp.returncode != 0:
+        msg = f"set_metadata failed rc={cp.returncode}"
+        if cp.stderr:
+            msg += f" stderr={cp.stderr.strip()[:500]}"
+        return False, msg
+    return True, "metadata applied"
 
-    # If we got a cover file, try to set it via --field cover:<path>.
-    # (cover is a standard field in calibre's database fields list.) :contentReference[oaicite:4]{index=4}
-    if os.path.exists(cover_path) and os.path.getsize(cover_path) > 0:
-        cp_cover = run(
-            [
-                "calibredb",
-                "--with-library",
-                LIB,
-                "set_metadata",
-                str(book_id),
-                "--field",
-                f"cover:{cover_path}",
-            ],
-            capture=True,
-            check=False,
-        )
-        if cp_cover.returncode != 0:
-            print(
-                f"[warn] id={book_id} title={title!r} (cover set failed; continuing)",
-                file=sys.stderr,
-            )
-            if cp_cover.stderr:
-                print(cp_cover.stderr, file=sys.stderr)
 
-    print(f"[ok] id={book_id} title={title!r}", file=sys.stderr)
-    return True
+def apply_cover_to_calibre_db(book_id: int, cover_path: str) -> Tuple[bool, str]:
+    if not os.path.exists(cover_path) or os.path.getsize(cover_path) == 0:
+        return True, "no cover downloaded"
+
+    # Set cover via --field cover:<path>
+    cp = run(
+        [
+            "calibredb",
+            "--with-library",
+            LIB,
+            "set_metadata",
+            str(book_id),
+            "--field",
+            f"cover:{cover_path}",
+        ],
+        capture=True,
+        check=False,
+    )
+    if cp.returncode != 0:
+        msg = f"cover set failed rc={cp.returncode}"
+        if cp.stderr:
+            msg += f" stderr={cp.stderr.strip()[:500]}"
+        return False, msg
+
+    return True, "cover applied"
+
+
+def embed_metadata_into_epub(book_id: int) -> Tuple[bool, str]:
+    # Update metadata in-place for EPUB files only
+    cp = run(
+        [
+            "calibredb",
+            "--with-library",
+            LIB,
+            "embed_metadata",
+            "--only-formats",
+            "EPUB",
+            str(book_id),
+        ],
+        capture=True,
+        check=False,
+    )
+    if cp.returncode != 0:
+        msg = f"embed_metadata failed rc={cp.returncode}"
+        if cp.stderr:
+            msg += f" stderr={cp.stderr.strip()[:500]}"
+        return False, msg
+    return True, "embedded"
+
+
+def process_one_book(state: Dict[str, Any], book: Dict[str, Any], workdir: str) -> None:
+    book_id = int(book["id"])
+    title = str(book.get("title") or "").strip()
+
+    snap = metadata_snapshot(book)
+    h = snapshot_hash(snap)
+
+    prev = get_book_state(state, book_id)
+    if (
+        prev
+        and prev.status in {"done", "skipped_good_enough", "embedded_only"}
+        and prev.last_hash == h
+    ):
+        log(
+            f"[skip] id={book_id} title={title!r} (already processed for current metadata hash)"
+        )
+        return
+
+    score, reasons = score_good_enough(snap)
+    good_enough = (
+        (score >= MIN_SCORE_TO_SKIP_FETCH)
+        and bool(snap["title"])
+        and bool(snap["authors"])
+    )
+
+    # If metadata is already good enough, we still want to ensure EPUB has embedded metadata at least once.
+    # If we don't have a record for this hash, we do an embed-only pass.
+    if good_enough:
+        log(
+            f"[ok?] id={book_id} title={title!r} score={score} -> good enough; embedding only"
+        )
+        ok_embed, msg_embed = embed_metadata_into_epub(book_id)
+
+        bs = BookState(
+            status="done" if ok_embed else "failed",
+            last_hash=h,
+            last_attempt_utc=now_iso(),
+            last_ok_utc=now_iso() if ok_embed else (prev.last_ok_utc if prev else None),
+            message=("good enough; embedded" if ok_embed else msg_embed)
+            + ("" if ok_embed else f" (good enough reasons: {', '.join(reasons)})"),
+            fail_count=(0 if ok_embed else ((prev.fail_count if prev else 0) + 1)),
+        )
+        put_book_state(state, book_id, bs)
+        save_state(state)
+
+        if ok_embed:
+            log(f"[done] id={book_id} title={title!r} (good enough; embedded)")
+        else:
+            log(f"[fail] id={book_id} title={title!r} ({msg_embed})")
+        return
+
+    # Otherwise, attempt full fetch -> apply -> embed
+    log(
+        f"[work] id={book_id} title={title!r} score={score} (not good enough; will fetch). missing: {', '.join(reasons)}"
+    )
+
+    opf_path = os.path.join(workdir, f"{book_id}.opf")
+    cover_path = os.path.join(workdir, f"{book_id}.cover.jpg")
+
+    ok_fetch, msg_fetch = fetch_metadata_to_opf_and_cover(book, opf_path, cover_path)
+    if not ok_fetch:
+        bs = BookState(
+            status="failed",
+            last_hash=h,
+            last_attempt_utc=now_iso(),
+            last_ok_utc=prev.last_ok_utc if prev else None,
+            message=msg_fetch,
+            fail_count=(prev.fail_count if prev else 0) + 1,
+        )
+        put_book_state(state, book_id, bs)
+        save_state(state)
+        log(f"[skip] id={book_id} title={title!r} ({msg_fetch})")
+        return
+
+    if DELAY_BETWEEN_FETCHES_SECONDS > 0:
+        time.sleep(DELAY_BETWEEN_FETCHES_SECONDS)
+
+    ok_set, msg_set = apply_opf_to_calibre_db(book_id, opf_path)
+    if not ok_set:
+        bs = BookState(
+            status="failed",
+            last_hash=h,
+            last_attempt_utc=now_iso(),
+            last_ok_utc=prev.last_ok_utc if prev else None,
+            message=msg_set,
+            fail_count=(prev.fail_count if prev else 0) + 1,
+        )
+        put_book_state(state, book_id, bs)
+        save_state(state)
+        log(f"[skip] id={book_id} title={title!r} ({msg_set})")
+        return
+
+    # Best-effort cover application
+    ok_cov, msg_cov = apply_cover_to_calibre_db(book_id, cover_path)
+    if not ok_cov:
+        log(f"[warn] id={book_id} title={title!r} ({msg_cov})")
+
+    # Now embed metadata into the EPUB file(s)
+    ok_embed, msg_embed = embed_metadata_into_epub(book_id)
+    if not ok_embed:
+        bs = BookState(
+            status="failed",
+            last_hash=h,
+            last_attempt_utc=now_iso(),
+            last_ok_utc=prev.last_ok_utc if prev else None,
+            message=msg_embed,
+            fail_count=(prev.fail_count if prev else 0) + 1,
+        )
+        put_book_state(state, book_id, bs)
+        save_state(state)
+        log(f"[skip] id={book_id} title={title!r} ({msg_embed})")
+        return
+
+    # Re-read the book list entry to capture the post-update DB snapshot hash,
+    # so future runs are idempotent even after metadata changed.
+    # We do a lightweight "list --search id:X" call.
+    refreshed = refresh_one_book(book_id)
+    new_snap = metadata_snapshot(refreshed) if refreshed else snap
+    new_hash = snapshot_hash(new_snap)
+
+    bs = BookState(
+        status="done",
+        last_hash=new_hash,
+        last_attempt_utc=now_iso(),
+        last_ok_utc=now_iso(),
+        message="fetched+applied+embedded",
+        fail_count=0,
+    )
+    put_book_state(state, book_id, bs)
+    save_state(state)
+    log(f"[done] id={book_id} title={title!r} (updated + embedded)")
+
+
+def refresh_one_book(book_id: int) -> Optional[Dict[str, Any]]:
+    fields = ",".join(
+        [
+            "id",
+            "title",
+            "authors",
+            "publisher",
+            "pubdate",
+            "languages",
+            "formats",
+            "isbn",
+            "identifiers",
+            "tags",
+            "comments",
+            "cover",
+            "last_modified",
+        ]
+    )
+    cp = run(
+        [
+            "calibredb",
+            "--with-library",
+            LIB,
+            "list",
+            "--for-machine",
+            "--fields",
+            fields,
+            "--search",
+            f"id:{book_id}",
+        ],
+        capture=True,
+        check=False,
+    )
+    if cp.returncode != 0 or not cp.stdout:
+        return None
+    try:
+        data = json.loads(cp.stdout)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        return data[0]
+    return None
+
+
+# -----------------------
+# Main
+# -----------------------
 
 
 def main() -> int:
     require_tool("calibredb")
     require_tool("fetch-ebook-metadata")
 
-    books = get_books()
-    print(f"[info] Found {len(books)} English EPUB books in: {LIB}", file=sys.stderr)
+    if not os.path.isdir(LIB):
+        raise SystemExit(f"Library path does not exist or is not a directory: {LIB}")
+
+    state = load_state()
+    books = list_candidate_books()
+
+    log(f"[info] library={LIB}")
+    log(f"[info] state={STATE_PATH}")
+    log(f"[info] candidates={len(books)} (EPUB + English-or-missing-language)")
 
     ok = 0
     fail = 0
+    skipped = 0
 
-    with tempfile.TemporaryDirectory(prefix="calibre-meta-") as workdir:
+    with tempfile.TemporaryDirectory(prefix="calibre-meta-", dir=None) as workdir:
         for b in books:
+            book_id = int(b["id"])
+            title = str(b.get("title") or "").strip()
             try:
-                if update_one(b, workdir):
+                prev = get_book_state(state, book_id)
+                before_hash = snapshot_hash(metadata_snapshot(b))
+                if (
+                    prev
+                    and prev.status in {"done", "skipped_good_enough", "embedded_only"}
+                    and prev.last_hash == before_hash
+                ):
+                    skipped += 1
+                    log(f"[skip] id={book_id} title={title!r} (already processed)")
+                    continue
+
+                process_one_book(state, b, workdir)
+
+                # classify outcome based on fresh state
+                after = get_book_state(state, book_id)
+                if after and after.status == "done":
                     ok += 1
-                else:
+                elif after and after.status == "failed":
                     fail += 1
+                else:
+                    # should not happen often, but keep counters sane
+                    skipped += 1
+
             except Exception as e:
-                book_id = b.get("id")
-                title = b.get("title")
-                print(
-                    f"[skip] id={book_id} title={title!r} (exception: {e})",
-                    file=sys.stderr,
-                )
                 fail += 1
+                prev = get_book_state(state, book_id)
+                snap = metadata_snapshot(b)
+                h = snapshot_hash(snap)
+                bs = BookState(
+                    status="failed",
+                    last_hash=h,
+                    last_attempt_utc=now_iso(),
+                    last_ok_utc=prev.last_ok_utc if prev else None,
+                    message=f"exception: {e}",
+                    fail_count=(prev.fail_count if prev else 0) + 1,
+                )
+                put_book_state(state, book_id, bs)
+                save_state(state)
+                log(f"[fail] id={book_id} title={title!r} (exception: {e})")
 
-    print(f"\n[done] ok={ok} skipped_or_failed={fail}", file=sys.stderr)
-
-    # Optional: if you want the updated Calibre DB metadata embedded into the EPUB files stored in the library,
-    # you can run calibredb embed_metadata afterward. :contentReference[oaicite:5]{index=5}
-    # (Not done automatically here.)
+    log(f"[summary] done_ok={ok} done_failed={fail} skipped={skipped}")
     return 0
 
 
