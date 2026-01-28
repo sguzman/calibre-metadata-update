@@ -44,9 +44,9 @@ from typing import Any, Dict, List, Optional, Tuple
 # User config
 # -----------------------
 
-DEFAULT_LIB = "/drive/calibre/en_nonfiction"
-LIB = DEFAULT_LIB
-STATE_PATH = os.path.join(LIB, ".calibre_metadata_state.json")
+DEFAULT_LIB: Optional[str] = None
+LIB = ""
+STATE_PATH = ""
 
 # File formats to operate on (calibre formats, lowercase)
 DEFAULT_FORMATS = {"epub"}
@@ -753,8 +753,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--library",
         dest="library",
-        default=DEFAULT_LIB,
-        help="Path to Calibre library (default: %(default)s)",
+        required=True,
+        help="Path to Calibre library",
     )
     parser.add_argument(
         "--formats",
@@ -771,6 +771,8 @@ def main() -> int:
 
     args = parse_args()
     global LIB, STATE_PATH
+    if not args.library:
+        raise SystemExit("Missing required --library path to Calibre library.")
     LIB = args.library
     STATE_PATH = os.path.join(LIB, ".calibre_metadata_state.json")
     target_formats = {
