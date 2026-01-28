@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Calibre bulk metadata updater + EPUB embedder (idempotent).
+Calibre bulk metadata updater + format embedder (idempotent).
 
 What it does:
-- Finds all books that have EPUB format in the library.
+- Finds all books that have one of the target formats in the library.
 - Filters to "English" OR "language missing" (so you can fix missing language too).
 - For each book:
   - If already "good enough" and already processed (tracked), skip.
@@ -12,7 +12,7 @@ What it does:
       - fetch-ebook-metadata -> OPF (+cover if found)
       - calibredb set_metadata (apply OPF to Calibre DB)
       - (optional) set cover field if downloaded
-      - calibredb embed_metadata --only-formats EPUB (write metadata into file)
+      - calibredb embed_metadata --only-formats <formats> (write metadata into files)
 - If any step fails for a given book: record failure + continue.
 
 State:
@@ -48,8 +48,8 @@ DEFAULT_LIB = "/drive/calibre/en_nonfiction"
 LIB = DEFAULT_LIB
 STATE_PATH = os.path.join(LIB, ".calibre_metadata_state.json")
 
-# Only EPUB books (we filter in code; search is just a coarse prefilter)
-CALIBRE_SEARCH_EXPR = "formats:epub"
+# File formats to operate on (calibre formats, lowercase)
+DEFAULT_FORMATS = {"epub"}
 
 # Treat as English if languages contains any of these (calibre often uses ISO639-3 like "eng")
 ENGLISH_CODES = {"en", "eng", "en-us", "en-gb"}
@@ -146,16 +146,27 @@ def is_english_or_missing(langs: List[str]) -> bool:
     return False
 
 
-def has_epub(formats_val: Any) -> bool:
-    if formats_val is None:
+def normalize_formats(val: Any) -> List[str]:
+    if val is None:
+        return []
+    if isinstance(val, list):
+        out = []
+        for x in val:
+            if x is None:
+                continue
+            s = str(x).strip().lower()
+            if s:
+                out.append(s)
+        return out
+    s = str(val).lower()
+    return [x.strip() for x in s.replace(";", ",").split(",") if x.strip()]
+
+
+def has_any_format(formats_val: Any, targets: set[str]) -> bool:
+    fmts = normalize_formats(formats_val)
+    if not fmts:
         return False
-    if isinstance(formats_val, list):
-        return any(
-            str(x).strip().lower() == "epub" for x in formats_val if x is not None
-        )
-    # Sometimes "EPUB, MOBI" etc
-    s = str(formats_val).lower()
-    return "epub" in {x.strip() for x in s.replace(";", ",").split(",")}
+    return any(f in targets for f in fmts)
 
 
 def normalize_identifiers(val: Any) -> Dict[str, str]:
@@ -344,7 +355,7 @@ def put_book_state(state: Dict[str, Any], book_id: int, bs: BookState) -> None:
 # -----------------------
 
 
-def list_candidate_books() -> List[Dict[str, Any]]:
+def list_candidate_books(target_formats: set[str]) -> List[Dict[str, Any]]:
     # Pull enough fields to:
     # - decide english/missing language
     # - compute snapshot hash + good-enough score
@@ -366,6 +377,9 @@ def list_candidate_books() -> List[Dict[str, Any]]:
         ]
     )
 
+    if not target_formats:
+        raise SystemExit("No target formats provided.")
+    search_expr = " or ".join(f"formats:{f}" for f in sorted(target_formats))
     cp = run(
         [
             "calibredb",
@@ -376,7 +390,7 @@ def list_candidate_books() -> List[Dict[str, Any]]:
             "--fields",
             fields,
             "--search",
-            CALIBRE_SEARCH_EXPR,
+            search_expr,
         ],
         capture=True,
         check=True,
@@ -396,7 +410,7 @@ def list_candidate_books() -> List[Dict[str, Any]]:
     for b in data:
         if not isinstance(b, dict):
             continue
-        if not has_epub(b.get("formats")):
+        if not has_any_format(b.get("formats"), target_formats):
             continue
         langs = normalize_languages(b.get("languages"))
         if not is_english_or_missing(langs):
@@ -498,8 +512,13 @@ def apply_cover_to_calibre_db(book_id: int, cover_path: str) -> Tuple[bool, str]
     return True, "cover applied"
 
 
-def embed_metadata_into_epub(book_id: int) -> Tuple[bool, str]:
-    # Update metadata in-place for EPUB files only
+def embed_metadata_into_formats(
+    book_id: int, target_formats: set[str]
+) -> Tuple[bool, str]:
+    # Update metadata in-place for target formats only
+    if not target_formats:
+        return False, "no target formats"
+    fmt_arg = ",".join(sorted(f.upper() for f in target_formats))
     cp = run(
         [
             "calibredb",
@@ -507,7 +526,7 @@ def embed_metadata_into_epub(book_id: int) -> Tuple[bool, str]:
             LIB,
             "embed_metadata",
             "--only-formats",
-            "EPUB",
+            fmt_arg,
             str(book_id),
         ],
         capture=True,
@@ -521,7 +540,12 @@ def embed_metadata_into_epub(book_id: int) -> Tuple[bool, str]:
     return True, "embedded"
 
 
-def process_one_book(state: Dict[str, Any], book: Dict[str, Any], workdir: str) -> None:
+def process_one_book(
+    state: Dict[str, Any],
+    book: Dict[str, Any],
+    workdir: str,
+    target_formats: set[str],
+) -> None:
     book_id = int(book["id"])
     title = str(book.get("title") or "").strip()
 
@@ -552,7 +576,7 @@ def process_one_book(state: Dict[str, Any], book: Dict[str, Any], workdir: str) 
         log(
             f"[ok?] id={book_id} title={title!r} score={score} -> good enough; embedding only"
         )
-        ok_embed, msg_embed = embed_metadata_into_epub(book_id)
+        ok_embed, msg_embed = embed_metadata_into_formats(book_id, target_formats)
 
         bs = BookState(
             status="embedded_only" if ok_embed else "failed",
@@ -619,7 +643,7 @@ def process_one_book(state: Dict[str, Any], book: Dict[str, Any], workdir: str) 
         log(f"[warn] id={book_id} title={title!r} ({msg_cov})")
 
     # Now embed metadata into the EPUB file(s)
-    ok_embed, msg_embed = embed_metadata_into_epub(book_id)
+    ok_embed, msg_embed = embed_metadata_into_formats(book_id, target_formats)
     if not ok_embed:
         bs = BookState(
             status="failed",
@@ -705,13 +729,19 @@ def refresh_one_book(book_id: int) -> Optional[Dict[str, Any]]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Calibre bulk metadata updater + EPUB embedder"
+        description="Calibre bulk metadata updater + format embedder"
     )
     parser.add_argument(
         "--library",
         dest="library",
         default=DEFAULT_LIB,
         help="Path to Calibre library (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--formats",
+        dest="formats",
+        default=",".join(sorted(DEFAULT_FORMATS)),
+        help="Comma-separated Calibre formats to process (default: %(default)s)",
     )
     return parser.parse_args()
 
@@ -724,16 +754,23 @@ def main() -> int:
     global LIB, STATE_PATH
     LIB = args.library
     STATE_PATH = os.path.join(LIB, ".calibre_metadata_state.json")
+    target_formats = {
+        f.strip().lower() for f in args.formats.split(",") if f.strip()
+    }
+    if not target_formats:
+        raise SystemExit("No formats specified. Use --formats epub,pdf")
 
     if not os.path.isdir(LIB):
         raise SystemExit(f"Library path does not exist or is not a directory: {LIB}")
 
     state = load_state()
-    books = list_candidate_books()
+    books = list_candidate_books(target_formats)
 
     log(f"[info] library={LIB}")
     log(f"[info] state={STATE_PATH}")
-    log(f"[info] candidates={len(books)} (EPUB + English-or-missing-language)")
+    log(
+        f"[info] candidates={len(books)} (formats={','.join(sorted(target_formats))} + English-or-missing-language)"
+    )
 
     ok = 0
     fail = 0
@@ -757,7 +794,7 @@ def main() -> int:
                         log(f"[skip] id={book_id} title={title!r} ({reason})")
                         continue
 
-                process_one_book(state, b, workdir)
+                process_one_book(state, b, workdir, target_formats)
 
                 # classify outcome based on fresh state
                 after = get_book_state(state, book_id)
