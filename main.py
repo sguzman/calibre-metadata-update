@@ -146,6 +146,14 @@ def run(
             last_cp = cp
             if cp.returncode == 0:
                 return cp
+        # Log details from the last failed attempt for debugging.
+        if last_cp is not None:
+            stderr = (last_cp.stderr or "").strip()
+            stdout = (last_cp.stdout or "").strip()
+            if stderr:
+                log(f"[calibredb stderr] {stderr[:2000]}")
+            if stdout:
+                log(f"[calibredb stdout] {stdout[:2000]}")
         return last_cp
 
     return _run_with({})
