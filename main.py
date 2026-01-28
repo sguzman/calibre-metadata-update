@@ -68,11 +68,26 @@ DELAY_BETWEEN_FETCHES_SECONDS = 0.35
 REPROCESS_ON_METADATA_CHANGE = False
 
 # Force a sane locale for calibredb (helps avoid locale-related startup errors)
-CALIBRE_ENV = {
-    "LC_ALL": "en_US.utf8",
-    "LANG": "en_US.utf8",
-    "LANGUAGE": "en_US:en",
-}
+CALIBRE_ENVS = [
+    {
+        "LC_ALL": "en_US.utf8",
+        "LANG": "en_US.utf8",
+        "LANGUAGE": "en_US:en",
+        "CALIBRE_OVERRIDE_LANG": "en",
+    },
+    {
+        "LC_ALL": "C.utf8",
+        "LANG": "C.utf8",
+        "LANGUAGE": "en",
+        "CALIBRE_OVERRIDE_LANG": "en",
+    },
+    {
+        "LC_ALL": "C",
+        "LANG": "C",
+        "LANGUAGE": "en",
+        "CALIBRE_OVERRIDE_LANG": "en",
+    },
+]
 
 
 # -----------------------
@@ -98,18 +113,33 @@ def run(
     env: Optional[Dict[str, str]] = None,
 ) -> subprocess.CompletedProcess[str]:
     log(f"[cmd] {' '.join(cmd)}")
-    merged_env = os.environ.copy()
-    merged_env.update(CALIBRE_ENV)
+    base_env = os.environ.copy()
     if env:
-        merged_env.update(env)
-    return subprocess.run(
-        cmd,
-        text=True,
-        check=check,
-        stdout=subprocess.PIPE if capture else None,
-        stderr=subprocess.PIPE if capture else None,
-        env=merged_env,
-    )
+        base_env.update(env)
+
+    def _run_with(override_env: Dict[str, str]) -> subprocess.CompletedProcess[str]:
+        merged = base_env.copy()
+        merged.update(override_env)
+        return subprocess.run(
+            cmd,
+            text=True,
+            check=check,
+            stdout=subprocess.PIPE if capture else None,
+            stderr=subprocess.PIPE if capture else None,
+            env=merged,
+        )
+
+    # For calibredb, try a few locale overrides to avoid translator errors.
+    if cmd and os.path.basename(cmd[0]) == "calibredb":
+        last_cp: Optional[subprocess.CompletedProcess[str]] = None
+        for override in CALIBRE_ENVS:
+            cp = _run_with(override)
+            last_cp = cp
+            if cp.returncode == 0:
+                return cp
+        return last_cp if last_cp is not None else _run_with({})
+
+    return _run_with({})
 
 
 def now_iso() -> str:
