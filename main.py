@@ -564,7 +564,9 @@ def process_one_book(
     book: Dict[str, Any],
     workdir: str,
     target_formats: set[str],
-) -> None:
+    *,
+    dry_run: bool = False,
+) -> str:
     book_id = int(book["id"])
     title = str(book.get("title") or "").strip()
 
@@ -580,7 +582,7 @@ def process_one_book(
                 else "already processed for current metadata hash"
             )
             log(f"[skip] id={book_id} title={title!r} ({reason})")
-            return
+            return "skipped"
 
     score, reasons = score_good_enough(snap)
     good_enough = (
@@ -595,6 +597,12 @@ def process_one_book(
         log(
             f"[ok?] id={book_id} title={title!r} score={score} -> good enough; embedding only"
         )
+        if dry_run:
+            log(
+                f"[dry-run] id={book_id} title={title!r} would embed metadata into formats: {','.join(sorted(target_formats))}"
+            )
+            return "embedded_only"
+
         ok_embed, msg_embed = embed_metadata_into_formats(book_id, target_formats)
 
         bs = BookState(
@@ -613,7 +621,7 @@ def process_one_book(
             log(f"[done] id={book_id} title={title!r} (good enough; embedded)")
         else:
             log(f"[fail] id={book_id} title={title!r} ({msg_embed})")
-        return
+        return "done" if ok_embed else "failed"
 
     # Otherwise, attempt full fetch -> apply -> embed
     log(
@@ -622,6 +630,12 @@ def process_one_book(
 
     opf_path = os.path.join(workdir, f"{book_id}.opf")
     cover_path = os.path.join(workdir, f"{book_id}.cover.jpg")
+
+    if dry_run:
+        log(
+            f"[dry-run] id={book_id} title={title!r} would fetch metadata -> apply -> embed (formats: {','.join(sorted(target_formats))})"
+        )
+        return "updated"
 
     ok_fetch, msg_fetch = fetch_metadata_to_opf_and_cover(book, opf_path, cover_path)
     if not ok_fetch:
@@ -636,7 +650,7 @@ def process_one_book(
         put_book_state(state, book_id, bs)
         save_state(state)
         log(f"[skip] id={book_id} title={title!r} ({msg_fetch})")
-        return
+        return "failed"
 
     if DELAY_BETWEEN_FETCHES_SECONDS > 0:
         time.sleep(DELAY_BETWEEN_FETCHES_SECONDS)
@@ -654,7 +668,7 @@ def process_one_book(
         put_book_state(state, book_id, bs)
         save_state(state)
         log(f"[skip] id={book_id} title={title!r} ({msg_set})")
-        return
+        return "failed"
 
     # Best-effort cover application
     ok_cov, msg_cov = apply_cover_to_calibre_db(book_id, cover_path)
@@ -675,7 +689,7 @@ def process_one_book(
         put_book_state(state, book_id, bs)
         save_state(state)
         log(f"[skip] id={book_id} title={title!r} ({msg_embed})")
-        return
+        return "failed"
 
     # Re-read the book list entry to capture the post-update DB snapshot hash,
     # so future runs are idempotent even after metadata changed.
@@ -695,6 +709,7 @@ def process_one_book(
     put_book_state(state, book_id, bs)
     save_state(state)
     log(f"[done] id={book_id} title={title!r} (updated + embedded)")
+    return "done"
 
 
 def refresh_one_book(book_id: int) -> Optional[Dict[str, Any]]:
@@ -762,6 +777,12 @@ def parse_args() -> argparse.Namespace:
         default=",".join(sorted(DEFAULT_FORMATS)),
         help="Comma-separated Calibre formats to process (default: %(default)s)",
     )
+    parser.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        help="Show what would happen without modifying the library",
+    )
     return parser.parse_args()
 
 
@@ -780,6 +801,7 @@ def main() -> int:
     }
     if not target_formats:
         raise SystemExit("No formats specified. Use --formats epub,pdf")
+    dry_run = bool(args.dry_run)
 
     if not os.path.isdir(LIB):
         raise SystemExit(f"Library path does not exist or is not a directory: {LIB}")
@@ -792,6 +814,8 @@ def main() -> int:
     log(
         f"[info] candidates={len(books)} (formats={','.join(sorted(target_formats))} + English-or-missing-language)"
     )
+    if dry_run:
+        log("[info] dry-run enabled (no changes will be written)")
 
     ok = 0
     fail = 0
@@ -815,20 +839,33 @@ def main() -> int:
                         log(f"[skip] id={book_id} title={title!r} ({reason})")
                         continue
 
-                process_one_book(state, b, workdir, target_formats)
+                action = process_one_book(
+                    state, b, workdir, target_formats, dry_run=dry_run
+                )
 
-                # classify outcome based on fresh state
-                after = get_book_state(state, book_id)
-                if after and after.status == "done":
-                    ok += 1
-                elif after and after.status == "failed":
-                    fail += 1
+                if dry_run:
+                    if action in {"done", "updated", "embedded_only"}:
+                        ok += 1
+                    elif action == "failed":
+                        fail += 1
+                    else:
+                        skipped += 1
                 else:
-                    # should not happen often, but keep counters sane
-                    skipped += 1
+                    # classify outcome based on fresh state
+                    after = get_book_state(state, book_id)
+                    if after and after.status == "done":
+                        ok += 1
+                    elif after and after.status == "failed":
+                        fail += 1
+                    else:
+                        # should not happen often, but keep counters sane
+                        skipped += 1
 
             except Exception as e:
                 fail += 1
+                if dry_run:
+                    log(f"[fail] id={book_id} title={title!r} (exception: {e})")
+                    continue
                 prev = get_book_state(state, book_id)
                 snap = metadata_snapshot(b)
                 h = snapshot_hash(snap)
