@@ -129,15 +129,18 @@ def run(
             env=merged,
         )
 
-    # For calibredb, try a few locale overrides to avoid translator errors.
+    # For calibredb, try the base environment first, then fallback overrides.
     if cmd and os.path.basename(cmd[0]) == "calibredb":
-        last_cp: Optional[subprocess.CompletedProcess[str]] = None
+        cp = _run_with({})
+        if cp.returncode == 0:
+            return cp
+        last_cp: Optional[subprocess.CompletedProcess[str]] = cp
         for override in CALIBRE_ENVS:
             cp = _run_with(override)
             last_cp = cp
             if cp.returncode == 0:
                 return cp
-        return last_cp if last_cp is not None else _run_with({})
+        return last_cp
 
     return _run_with({})
 
