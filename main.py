@@ -19,8 +19,9 @@ State:
 - Stored at: /drive/calibre/en_nonfiction/.calibre_metadata_state.json
 - Idempotence:
   - We compute a stable hash of the *current DB metadata snapshot* we care about.
-  - If a book was already processed for that same hash, we skip it on reruns.
-  - If you manually change metadata later, the hash changes and it will reprocess.
+  - By default, a book is processed only once (per book id), regardless of later metadata changes.
+  - If you want to allow reprocessing when metadata changes, set
+    REPROCESS_ON_METADATA_CHANGE = True.
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ import os
 import shutil
 import subprocess
 import sys
+import argparse
 import tempfile
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -42,7 +44,8 @@ from typing import Any, Dict, List, Optional, Tuple
 # User config
 # -----------------------
 
-LIB = "/drive/calibre/en_nonfiction"
+DEFAULT_LIB = "/drive/calibre/en_nonfiction"
+LIB = DEFAULT_LIB
 STATE_PATH = os.path.join(LIB, ".calibre_metadata_state.json")
 
 # Only EPUB books (we filter in code; search is just a coarse prefilter)
@@ -59,6 +62,10 @@ MIN_SCORE_TO_SKIP_FETCH = 6
 
 # Avoid hammering metadata sources (0.0 disables delay)
 DELAY_BETWEEN_FETCHES_SECONDS = 0.35
+
+# If True, a book is reprocessed when its metadata snapshot hash changes.
+# If False, a book is processed only once (per book id).
+REPROCESS_ON_METADATA_CHANGE = False
 
 
 # -----------------------
@@ -522,15 +529,15 @@ def process_one_book(state: Dict[str, Any], book: Dict[str, Any], workdir: str) 
     h = snapshot_hash(snap)
 
     prev = get_book_state(state, book_id)
-    if (
-        prev
-        and prev.status in {"done", "skipped_good_enough", "embedded_only"}
-        and prev.last_hash == h
-    ):
-        log(
-            f"[skip] id={book_id} title={title!r} (already processed for current metadata hash)"
-        )
-        return
+    if prev and prev.status in {"done", "skipped_good_enough", "embedded_only"}:
+        if (not REPROCESS_ON_METADATA_CHANGE) or (prev.last_hash == h):
+            reason = (
+                "already processed"
+                if not REPROCESS_ON_METADATA_CHANGE
+                else "already processed for current metadata hash"
+            )
+            log(f"[skip] id={book_id} title={title!r} ({reason})")
+            return
 
     score, reasons = score_good_enough(snap)
     good_enough = (
@@ -548,7 +555,7 @@ def process_one_book(state: Dict[str, Any], book: Dict[str, Any], workdir: str) 
         ok_embed, msg_embed = embed_metadata_into_epub(book_id)
 
         bs = BookState(
-            status="done" if ok_embed else "failed",
+            status="embedded_only" if ok_embed else "failed",
             last_hash=h,
             last_attempt_utc=now_iso(),
             last_ok_utc=now_iso() if ok_embed else (prev.last_ok_utc if prev else None),
@@ -696,9 +703,27 @@ def refresh_one_book(book_id: int) -> Optional[Dict[str, Any]]:
 # -----------------------
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Calibre bulk metadata updater + EPUB embedder"
+    )
+    parser.add_argument(
+        "--library",
+        dest="library",
+        default=DEFAULT_LIB,
+        help="Path to Calibre library (default: %(default)s)",
+    )
+    return parser.parse_args()
+
+
 def main() -> int:
     require_tool("calibredb")
     require_tool("fetch-ebook-metadata")
+
+    args = parse_args()
+    global LIB, STATE_PATH
+    LIB = args.library
+    STATE_PATH = os.path.join(LIB, ".calibre_metadata_state.json")
 
     if not os.path.isdir(LIB):
         raise SystemExit(f"Library path does not exist or is not a directory: {LIB}")
@@ -721,14 +746,16 @@ def main() -> int:
             try:
                 prev = get_book_state(state, book_id)
                 before_hash = snapshot_hash(metadata_snapshot(b))
-                if (
-                    prev
-                    and prev.status in {"done", "skipped_good_enough", "embedded_only"}
-                    and prev.last_hash == before_hash
-                ):
-                    skipped += 1
-                    log(f"[skip] id={book_id} title={title!r} (already processed)")
-                    continue
+                if prev and prev.status in {"done", "skipped_good_enough", "embedded_only"}:
+                    if (not REPROCESS_ON_METADATA_CHANGE) or (prev.last_hash == before_hash):
+                        skipped += 1
+                        reason = (
+                            "already processed"
+                            if not REPROCESS_ON_METADATA_CHANGE
+                            else "already processed for current metadata hash"
+                        )
+                        log(f"[skip] id={book_id} title={title!r} ({reason})")
+                        continue
 
                 process_one_book(state, b, workdir)
 
