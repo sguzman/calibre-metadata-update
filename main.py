@@ -67,6 +67,12 @@ DELAY_BETWEEN_FETCHES_SECONDS = 0.35
 # If False, a book is processed only once (per book id).
 REPROCESS_ON_METADATA_CHANGE = False
 
+# Force a sane locale for calibredb (helps avoid locale-related startup errors)
+CALIBRE_ENV = {
+    "LC_ALL": "C.UTF-8",
+    "LANG": "C.UTF-8",
+}
+
 
 # -----------------------
 # Helpers
@@ -91,13 +97,17 @@ def run(
     env: Optional[Dict[str, str]] = None,
 ) -> subprocess.CompletedProcess[str]:
     log(f"[cmd] {' '.join(cmd)}")
+    merged_env = os.environ.copy()
+    merged_env.update(CALIBRE_ENV)
+    if env:
+        merged_env.update(env)
     return subprocess.run(
         cmd,
         text=True,
         check=check,
         stdout=subprocess.PIPE if capture else None,
         stderr=subprocess.PIPE if capture else None,
-        env=env,
+        env=merged_env,
     )
 
 
