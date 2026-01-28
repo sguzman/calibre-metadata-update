@@ -175,6 +175,19 @@ def run(
                 log(f"[calibredb stderr] {stderr[:2000]}")
             if stdout:
                 log(f"[calibredb stdout] {stdout[:2000]}")
+            # If msgpack missing under uv/venv env, retry with a clean env once.
+            if "No module named 'msgpack'" in stderr:
+                clean_env = base_env.copy()
+                for key in list(clean_env.keys()):
+                    if key.startswith(
+                        ("PYTHON", "VIRTUAL_ENV", "UV_", "PIP_", "CONDA", "POETRY", "PYENV")
+                    ):
+                        clean_env.pop(key, None)
+                base_env = clean_env
+                cp2 = _run_with({})
+                if cp2.returncode == 0:
+                    log("[info] calibredb succeeded after cleaning env vars")
+                    return cp2
         return cp
 
     return _run_with({})
