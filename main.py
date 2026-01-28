@@ -803,6 +803,12 @@ def parse_args() -> argparse.Namespace:
         help="Path to Calibre library",
     )
     parser.add_argument(
+        "--state-path",
+        dest="state_path",
+        default=None,
+        help="Path to state file (default: <library>/.calibre_metadata_state.json or CWD for remote libraries)",
+    )
+    parser.add_argument(
         "--formats",
         dest="formats",
         default=",".join(sorted(DEFAULT_FORMATS)),
@@ -826,7 +832,14 @@ def main() -> int:
     if not args.library:
         raise SystemExit("Missing required --library path to Calibre library.")
     LIB = args.library
-    STATE_PATH = os.path.join(LIB, ".calibre_metadata_state.json")
+    is_remote = LIB.startswith("http://") or LIB.startswith("https://")
+    if args.state_path:
+        STATE_PATH = args.state_path
+    else:
+        if is_remote:
+            STATE_PATH = os.path.join(os.getcwd(), ".calibre_metadata_state.json")
+        else:
+            STATE_PATH = os.path.join(LIB, ".calibre_metadata_state.json")
     target_formats = {
         f.strip().lower() for f in args.formats.split(",") if f.strip()
     }
@@ -834,7 +847,7 @@ def main() -> int:
         raise SystemExit("No formats specified. Use --formats epub,pdf")
     dry_run = bool(args.dry_run)
 
-    if not os.path.isdir(LIB):
+    if not is_remote and not os.path.isdir(LIB):
         raise SystemExit(f"Library path does not exist or is not a directory: {LIB}")
 
     state = load_state()
