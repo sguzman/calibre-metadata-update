@@ -393,8 +393,17 @@ def list_candidate_books(target_formats: set[str]) -> List[Dict[str, Any]]:
             search_expr,
         ],
         capture=True,
-        check=True,
+        check=False,
     )
+
+    if cp.returncode != 0:
+        stderr = (cp.stderr or "").strip()
+        if "no books matching the search expression" in stderr.lower():
+            return []
+        log(f"[fatal] calibredb list failed rc={cp.returncode}")
+        if stderr:
+            log(stderr[:500])
+        raise SystemExit("calibredb list failed")
 
     try:
         data = json.loads(cp.stdout)
