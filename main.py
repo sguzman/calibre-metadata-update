@@ -69,8 +69,9 @@ REPROCESS_ON_METADATA_CHANGE = False
 
 # Force a sane locale for calibredb (helps avoid locale-related startup errors)
 CALIBRE_ENV = {
-    "LC_ALL": "C.UTF-8",
-    "LANG": "C.UTF-8",
+    "LC_ALL": "en_US.utf8",
+    "LANG": "en_US.utf8",
+    "LANGUAGE": "en_US:en",
 }
 
 
