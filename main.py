@@ -89,6 +89,8 @@ CALIBRE_ENVS = [
     },
 ]
 
+CALIBRE_ENV_MODES = {"inherit", "clean", "override"}
+
 
 # -----------------------
 # Helpers
@@ -103,6 +105,9 @@ def log(msg: str) -> None:
 def require_tool(name: str) -> None:
     if shutil.which(name) is None:
         raise SystemExit(f"Missing required tool on PATH: {name}")
+
+
+CALIBREDB_ENV_MODE = "inherit"
 
 
 def run(
@@ -129,32 +134,48 @@ def run(
             env=merged,
         )
 
-    # For calibredb, strip Python/virtualenv variables that can break the system Calibre install.
+    # For calibredb, allow opt-in environment handling.
     if cmd and os.path.basename(cmd[0]) == "calibredb":
-        clean_env = base_env.copy()
-        for key in list(clean_env.keys()):
-            if key.startswith(("PYTHON", "VIRTUAL_ENV", "UV_", "PIP_", "CONDA", "POETRY", "PYENV")):
-                clean_env.pop(key, None)
-        base_env = clean_env
-
-        cp = _run_with({})
-        if cp.returncode == 0:
+        mode = CALIBREDB_ENV_MODE
+        if mode == "clean":
+            clean_env = base_env.copy()
+            for key in list(clean_env.keys()):
+                if key.startswith(
+                    ("PYTHON", "VIRTUAL_ENV", "UV_", "PIP_", "CONDA", "POETRY", "PYENV")
+                ):
+                    clean_env.pop(key, None)
+            base_env = clean_env
+            cp = _run_with({})
             return cp
-        last_cp: Optional[subprocess.CompletedProcess[str]] = cp
-        for override in CALIBRE_ENVS:
-            cp = _run_with(override)
-            last_cp = cp
+        if mode == "override":
+            cp = _run_with({})
             if cp.returncode == 0:
                 return cp
-        # Log details from the last failed attempt for debugging.
-        if last_cp is not None:
-            stderr = (last_cp.stderr or "").strip()
-            stdout = (last_cp.stdout or "").strip()
+            last_cp: Optional[subprocess.CompletedProcess[str]] = cp
+            for override in CALIBRE_ENVS:
+                cp = _run_with(override)
+                last_cp = cp
+                if cp.returncode == 0:
+                    return cp
+            # Log details from the last failed attempt for debugging.
+            if last_cp is not None:
+                stderr = (last_cp.stderr or "").strip()
+                stdout = (last_cp.stdout or "").strip()
+                if stderr:
+                    log(f"[calibredb stderr] {stderr[:2000]}")
+                if stdout:
+                    log(f"[calibredb stdout] {stdout[:2000]}")
+            return last_cp
+        # inherit
+        cp = _run_with({})
+        if cp.returncode != 0:
+            stderr = (cp.stderr or "").strip()
+            stdout = (cp.stdout or "").strip()
             if stderr:
                 log(f"[calibredb stderr] {stderr[:2000]}")
             if stdout:
                 log(f"[calibredb stdout] {stdout[:2000]}")
-        return last_cp
+        return cp
 
     return _run_with({})
 
@@ -837,6 +858,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Show what would happen without modifying the library",
     )
+    parser.add_argument(
+        "--calibredb-env",
+        dest="calibredb_env",
+        default="inherit",
+        choices=sorted(CALIBRE_ENV_MODES),
+        help="Environment handling for calibredb: inherit (default), clean, or override",
+    )
     return parser.parse_args()
 
 
@@ -863,6 +891,8 @@ def main() -> int:
     if not target_formats:
         raise SystemExit("No formats specified. Use --formats epub,pdf")
     dry_run = bool(args.dry_run)
+    global CALIBREDB_ENV_MODE
+    CALIBREDB_ENV_MODE = args.calibredb_env
 
     if not is_remote and not os.path.isdir(LIB):
         raise SystemExit(f"Library path does not exist or is not a directory: {LIB}")
