@@ -90,6 +90,7 @@ CALIBRE_ENVS = [
 ]
 
 CALIBRE_ENV_MODES = {"inherit", "clean", "override"}
+SYSTEM_PYTHON = "/usr/bin/python"
 
 
 # -----------------------
@@ -108,6 +109,15 @@ def require_tool(name: str) -> None:
 
 
 CALIBREDB_ENV_MODE = "inherit"
+
+
+def ensure_system_python() -> None:
+    if os.path.exists(SYSTEM_PYTHON):
+        current = os.path.realpath(sys.executable)
+        target = os.path.realpath(SYSTEM_PYTHON)
+        if current != target:
+            log(f"[info] re-exec with system python: {SYSTEM_PYTHON}")
+            os.execv(SYSTEM_PYTHON, [SYSTEM_PYTHON, *sys.argv])
 
 
 def run(
@@ -882,6 +892,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    ensure_system_python()
     require_tool("calibredb")
     require_tool("fetch-ebook-metadata")
 
