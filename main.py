@@ -129,8 +129,14 @@ def run(
             env=merged,
         )
 
-    # For calibredb, try the base environment first, then fallback overrides.
+    # For calibredb, strip Python/virtualenv variables that can break the system Calibre install.
     if cmd and os.path.basename(cmd[0]) == "calibredb":
+        clean_env = base_env.copy()
+        for key in list(clean_env.keys()):
+            if key.startswith(("PYTHON", "VIRTUAL_ENV", "UV_", "PIP_", "CONDA", "POETRY", "PYENV")):
+                clean_env.pop(key, None)
+        base_env = clean_env
+
         cp = _run_with({})
         if cp.returncode == 0:
             return cp
